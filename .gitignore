@@ -1,1 +1,5 @@
 .env
+*.db
+*.tsv
+influx_import.txt
+myenv/

@@ -57,15 +57,30 @@ cp .env.example .env
 Open the `.env` file in a text editor and provide the necessary configurations for your InfluxDB connection.
 
 ```plaintext
+SQLITE_DB=/path/to/home-assistant_v2.db
 INFLUXDB_URL=http://localhost:8086
 INFLUXDB_TOKEN=your_token
 INFLUXDB_ORG=your_organization
 INFLUXDB_BUCKET=your_bucket
-SQLITE_DB_PATH=/path/to/your/sqlite.db
+
+BATCH_SIZE=5000
 DEBUG_MODE=false
+SOURCE_TAG=HA
+INCLUDE_ATTRIBUTES=true
+EXCLUDE_ENTITY_ID_REGEX=
+INFLUX_SOURCE_FILTER=
 ```
 
-When DEBUG_MODE is true. The script will insert into Influx point by point
+| Variable | Purpose |
+| --- | --- |
+| `SQLITE_DB` | Path to the Home Assistant SQLite DB (opened read-only). |
+| `INFLUXDB_URL` / `INFLUXDB_TOKEN` / `INFLUXDB_ORG` / `INFLUXDB_BUCKET` | InfluxDB v2 connection. |
+| `BATCH_SIZE` | Rows fetched from SQLite and written to Influx per batch. |
+| `DEBUG_MODE` | When true, writes points one-by-one and logs the offending point on failure. |
+| `SOURCE_TAG` | Value written to the `source` tag on every point. |
+| `INCLUDE_ATTRIBUTES` | When true, HA attributes are written as additional fields. |
+| `EXCLUDE_ENTITY_ID_REGEX` | Optional regex; matching `entity_id`s are skipped. |
+| `INFLUX_SOURCE_FILTER` | Optional `source` tag value used when looking up the oldest point already in the bucket. Must not contain quotes or backslashes. |
 
 ## Usage
 
