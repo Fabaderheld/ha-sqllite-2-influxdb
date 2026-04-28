@@ -78,6 +78,13 @@ INFLUX_SOURCE_FILTER=
 | `BATCH_SIZE` | Rows fetched from SQLite and written to Influx per batch. |
 | `DEBUG_MODE` | When true, writes points one-by-one and logs the offending point on failure. |
 | `DRY_RUN` | When true, prints the row count and date range that would be exported and exits without writing. |
+| `EXPORT_WINDOW_DAYS` | Size of the time window the SQLite read is chunked into. Default 30; smaller windows give more frequent progress logs. |
+
+### What to expect during a run
+
+The export streams SQLite in `EXPORT_WINDOW_DAYS`-day windows so the `last_updated_ts` index can be used for both the range filter and the ordering — without windowing, a single `ORDER BY` over hundreds of millions of rows can stall for hours before the first row is written. Per-window progress lines (`Chunk K/N: ...`) appear as work proceeds, plus a `still working — Xs elapsed` heartbeat every 30 s if anything goes quiet.
+
+InfluxDB's data directory size fluctuates on its own: background TSM compaction rewrites and snappy-compresses shards, so size dips are normal even mid-run and don't indicate data loss. Confirm writes via `influx query` or the UI rather than `du`.
 | `SOURCE_TAG` | Value written to the `source` tag on every point. |
 | `INCLUDE_ATTRIBUTES` | When true, HA attributes are written as additional fields. |
 | `EXCLUDE_ENTITY_ID_REGEX` | Optional regex; matching `entity_id`s are skipped. |

@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from math import isfinite
 
@@ -27,6 +29,7 @@ SOURCE_TAG = os.getenv("SOURCE_TAG", "HA")
 INCLUDE_ATTRIBUTES = os.getenv("INCLUDE_ATTRIBUTES", "true").lower() == "true"
 EXCLUDE_ENTITY_ID_REGEX = os.getenv("EXCLUDE_ENTITY_ID_REGEX", "").strip()
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+EXPORT_WINDOW_DAYS = int(os.getenv("EXPORT_WINDOW_DAYS", "30"))
 
 INFLUX_SOURCE_FILTER = os.getenv("INFLUX_SOURCE_FILTER", "").strip()
 if INFLUX_SOURCE_FILTER and re.search(r'["\\]', INFLUX_SOURCE_FILTER):
@@ -112,7 +115,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
         return None
 
 
-def build_sqlite_query(has_cutoff):
+def build_sqlite_query(has_lower=False, has_upper=False):
     base_query = """
 SELECT
     s.state,
@@ -127,11 +130,48 @@ JOIN states_meta sm
 WHERE s.last_updated_ts IS NOT NULL
 """
 
-    if has_cutoff:
+    if has_lower:
+        base_query += " AND s.last_updated_ts >= ?"
+    if has_upper:
         base_query += " AND s.last_updated_ts < ?"
 
     base_query += " ORDER BY s.last_updated_ts ASC"
     return base_query
+
+
+def get_sqlite_range(cursor, upper_epoch):
+    sql = "SELECT MIN(last_updated_ts), MAX(last_updated_ts) FROM states WHERE last_updated_ts IS NOT NULL"
+    if upper_epoch is not None:
+        sql += " AND last_updated_ts < ?"
+        cursor.execute(sql, (upper_epoch,))
+    else:
+        cursor.execute(sql)
+    return cursor.fetchone()
+
+
+def compute_windows(min_ts, end_ts, window_days):
+    step = window_days * 86400
+    windows = []
+    lo = float(min_ts)
+    end = float(end_ts)
+    while lo < end:
+        hi = min(lo + step, end)
+        windows.append((lo, hi))
+        lo = hi
+    return windows
+
+
+def start_heartbeat(get_state):
+    stop = threading.Event()
+
+    def beat():
+        start = time.monotonic()
+        while not stop.wait(30):
+            elapsed = int(time.monotonic() - start)
+            logging.info("still working — %ds elapsed, %s", elapsed, get_state())
+
+    threading.Thread(target=beat, daemon=True).start()
+    return stop
 
 
 def summarize_sqlite_range(cursor, oldest_epoch):
@@ -341,30 +381,54 @@ def main():
             raise SystemExit(exit_code)
         return
 
-    sql = build_sqlite_query(has_cutoff=(oldest_epoch is not None))
-
+    sql = build_sqlite_query(has_lower=True, has_upper=True)
     logging.debug("SQLite query: %s", " ".join(sql.split()))
-    if oldest_epoch is not None:
-        logging.info("Using cutoff epoch: %s", oldest_epoch)
+
+    state = {"chunk": "init", "rows": 0}
+    hb_stop = start_heartbeat(lambda: f"chunk={state['chunk']}, rows={state['rows']}")
 
     try:
-        if oldest_epoch is not None:
-            cursor.execute(sql, (oldest_epoch,))
+        logging.info("Computing SQLite time range...")
+        min_ts, max_ts = get_sqlite_range(cursor, oldest_epoch)
+
+        if min_ts is None:
+            logging.info("No rows to export.")
         else:
-            cursor.execute(sql)
+            end_ts = float(oldest_epoch) if oldest_epoch is not None else float(max_ts) + 1.0
+            windows = compute_windows(min_ts, end_ts, EXPORT_WINDOW_DAYS)
+            logging.info(
+                "Export range: %s -> %s in %s window(s) of %sd",
+                datetime.fromtimestamp(float(min_ts), tz=timezone.utc).isoformat(),
+                datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
+                len(windows),
+                EXPORT_WINDOW_DAYS,
+            )
 
-        logging.info("Started reading from SQLite...")
+            cursor.execute("EXPLAIN QUERY PLAN " + sql, (windows[0][0], windows[0][1]))
+            for plan_row in cursor.fetchall():
+                logging.info("plan: %s", plan_row)
 
-        while True:
-            rows = cursor.fetchmany(BATCH_SIZE)
-            if not rows:
-                break
+            for idx, (lo, hi) in enumerate(windows, start=1):
+                lo_iso = datetime.fromtimestamp(lo, tz=timezone.utc).isoformat()
+                hi_iso = datetime.fromtimestamp(hi, tz=timezone.utc).isoformat()
+                state["chunk"] = f"{idx}/{len(windows)}"
+                logging.info("Chunk %s: %s -> %s", state["chunk"], lo_iso, hi_iso)
 
-            batch_insert_to_influx(write_api, rows)
-            rows_fetched += len(rows)
-            logging.info("Fetched %s SQLite rows so far", rows_fetched)
+                cursor.execute(sql, (lo, hi))
+                chunk_rows = 0
+                while True:
+                    rows = cursor.fetchmany(BATCH_SIZE)
+                    if not rows:
+                        break
+                    batch_insert_to_influx(write_api, rows)
+                    chunk_rows += len(rows)
+                    rows_fetched += len(rows)
+                    state["rows"] = rows_fetched
+                    logging.info("  chunk %s: %s rows (total %s)", state["chunk"], chunk_rows, rows_fetched)
 
-        logging.info("Data export complete. Total SQLite rows fetched: %s", rows_fetched)
+                logging.info("Chunk %s done: %s rows", state["chunk"], chunk_rows)
+
+            logging.info("Data export complete. Total SQLite rows fetched: %s", rows_fetched)
 
     except sqlite3.Error as e:
         logging.error("SQLite query error: %s", e)
@@ -373,6 +437,7 @@ def main():
         logging.error("Aborting after batch write failure: %s", e)
         exit_code = 1
     finally:
+        hb_stop.set()
         try:
             cursor.close()
         except Exception:
