@@ -77,6 +77,7 @@ INFLUX_SOURCE_FILTER=
 | `INFLUXDB_URL` / `INFLUXDB_TOKEN` / `INFLUXDB_ORG` / `INFLUXDB_BUCKET` | InfluxDB v2 connection. |
 | `BATCH_SIZE` | Rows fetched from SQLite and written to Influx per batch. |
 | `DEBUG_MODE` | When true, writes points one-by-one and logs the offending point on failure. |
+| `DRY_RUN` | When true, prints the row count and date range that would be exported and exits without writing. |
 | `SOURCE_TAG` | Value written to the `source` tag on every point. |
 | `INCLUDE_ATTRIBUTES` | When true, HA attributes are written as additional fields. |
 | `EXCLUDE_ENTITY_ID_REGEX` | Optional regex; matching `entity_id`s are skipped. |

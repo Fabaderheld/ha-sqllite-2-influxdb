@@ -26,6 +26,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))
 SOURCE_TAG = os.getenv("SOURCE_TAG", "HA")
 INCLUDE_ATTRIBUTES = os.getenv("INCLUDE_ATTRIBUTES", "true").lower() == "true"
 EXCLUDE_ENTITY_ID_REGEX = os.getenv("EXCLUDE_ENTITY_ID_REGEX", "").strip()
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 INFLUX_SOURCE_FILTER = os.getenv("INFLUX_SOURCE_FILTER", "").strip()
 if INFLUX_SOURCE_FILTER and re.search(r'["\\]', INFLUX_SOURCE_FILTER):
@@ -129,6 +130,42 @@ WHERE s.last_updated_ts IS NOT NULL
 
     base_query += " ORDER BY s.last_updated_ts ASC"
     return base_query
+
+
+def summarize_sqlite_range(cursor, oldest_epoch):
+    sql = """
+SELECT COUNT(*), MIN(last_updated_ts), MAX(last_updated_ts)
+FROM states
+WHERE last_updated_ts IS NOT NULL
+"""
+    if oldest_epoch is not None:
+        sql += " AND last_updated_ts < ?"
+        cursor.execute(sql, (oldest_epoch,))
+    else:
+        cursor.execute(sql)
+
+    count, min_ts, max_ts = cursor.fetchone()
+
+    logging.info("DRY RUN — no data will be written.")
+    if oldest_epoch is not None:
+        cutoff_iso = datetime.fromtimestamp(oldest_epoch, tz=timezone.utc).isoformat()
+        logging.info("Cutoff:    %s (epoch=%s)", cutoff_iso, oldest_epoch)
+    else:
+        logging.info("Cutoff:    none — full history would be exported")
+
+    logging.info("Rows:      %s", f"{count:,}")
+
+    if count and min_ts is not None and max_ts is not None:
+        min_iso = datetime.fromtimestamp(float(min_ts), tz=timezone.utc).isoformat()
+        max_iso = datetime.fromtimestamp(float(max_ts), tz=timezone.utc).isoformat()
+        logging.info("Range:     %s -> %s", min_iso, max_iso)
+    else:
+        logging.info("Range:     n/a (no rows match)")
+
+    logging.info(
+        "Note: count/range are pre-filter; EXCLUDE_ENTITY_ID_REGEX and state filters "
+        "are applied per-row at write time and will reduce the actual point count."
+    )
 
 
 def parse_attributes(shared_attrs):
@@ -270,14 +307,43 @@ def main():
     client, write_api, query_api = connect_to_influxdb(INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG)
 
     oldest_epoch = get_oldest_influx_epoch(query_api)
+
+    rows_fetched = 0
+    exit_code = 0
+
+    if DRY_RUN:
+        try:
+            summarize_sqlite_range(cursor, oldest_epoch)
+        except sqlite3.Error as e:
+            logging.error("SQLite query error during dry run: %s", e)
+            exit_code = 1
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                write_api.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+            logging.info("Closed SQLite and InfluxDB connections.")
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     sql = build_sqlite_query(has_cutoff=(oldest_epoch is not None))
 
     logging.debug("SQLite query: %s", " ".join(sql.split()))
     if oldest_epoch is not None:
         logging.info("Using cutoff epoch: %s", oldest_epoch)
-
-    rows_fetched = 0
-    exit_code = 0
 
     try:
         if oldest_epoch is not None:
