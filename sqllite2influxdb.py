@@ -89,8 +89,10 @@ from(bucket: "{INFLUXDB_BUCKET}")
   |> range(start: 0)
   {source_filter}
   |> first()
+  |> keep(columns: ["_time"])
   |> group()
-  |> min(column: "_time")
+  |> sort(columns: ["_time"], desc: false)
+  |> limit(n: 1)
 '''
         result = query_api.query(org=INFLUXDB_ORG, query=query)
 
